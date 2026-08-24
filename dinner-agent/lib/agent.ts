@@ -80,11 +80,11 @@ export async function estimateMealFromPhoto(dataUrl: string): Promise<MealEstima
 const RECOMMENDATION_SCHEMA = {
   type: "object",
   properties: {
-    headline: { type: "string", description: "One short sentence naming the dinner to have tonight." },
-    what: { type: "string", description: "What to eat or prioritize. One or two short sentences." },
-    howMuch: { type: "string", description: "Approximate quantity and macro targets for the meal." },
-    byWhen: { type: "string", description: "When to finish dinner, using the latest ideal dinner time given." },
-    note: { type: "string", description: "One short line of context. Empty string if nothing useful to add." },
+    headline: { type: "string", description: "The action to take, at most 10 words. No preamble." },
+    what: { type: "string", description: "The foods to eat. One sentence, at most 16 words." },
+    howMuch: { type: "string", description: "Calories and protein first, then any other macro. At most 14 words." },
+    byWhen: { type: "string", description: "A time, at most 12 words. Say plainly if that time has passed." },
+    note: { type: "string", description: "One reason, at most 14 words. Empty string if there is nothing useful to add." },
   },
   required: ["headline", "what", "howMuch", "byWhen", "note"],
   additionalProperties: false,
@@ -92,7 +92,9 @@ const RECOMMENDATION_SCHEMA = {
 
 const RECOMMENDATION_SYSTEM = [
   "You advise on one dinner decision. You are calm, professional, and restrained.",
+  "Be brief. Every field is read in a couple of seconds, so respect its word limit strictly.",
   "Write short, plain, operational sentences. No marketing language, no hype, no urgency, no humor, no emoji.",
+  "Never repeat a number or a time in more than one field, and never restate the question.",
   "Do not make medical claims and do not diagnose. Keep guidance conservative and practical.",
   "Answer exactly three things: what to eat, how much, and by when.",
   "Base the quantity on the remaining calories and macros you are given.",

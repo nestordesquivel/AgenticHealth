@@ -22,7 +22,12 @@ type Day = {
 
 const STORAGE_KEY = "dinner-agent-day-v1";
 
-const today = () => new Date().toISOString().slice(0, 10);
+// Local date, not UTC: toISOString would roll the day over in the evening and
+// wipe a day that is still in progress.
+const today = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
 function loadDay(): Day {
   const fresh: Day = { date: today(), settings: DEFAULT_SETTINGS, meals: [], recommendation: null };
@@ -247,42 +252,22 @@ function Home({
         <div className="section-label">Current state</div>
         <div className="card">
           <div className="metric-primary">
-            <span className="value">{Math.max(0, s.caloriesRemaining).toLocaleString()}</span>
-            <span className="unit">kcal remaining today</span>
+            <span className="value" data-over={s.caloriesRemaining < 0}>
+              {Math.abs(s.caloriesRemaining).toLocaleString()}
+            </span>
+            <span className="unit">{s.caloriesRemaining < 0 ? "kcal over target" : "kcal left today"}</span>
           </div>
-          <div className="metric-caption">
-            {s.caloriesConsumed.toLocaleString()} of {s.caloriesTarget.toLocaleString()} kcal consumed
-            {s.caloriesRemaining < 0 && ` · ${Math.abs(s.caloriesRemaining).toLocaleString()} over target`}
-          </div>
-          <div className="bar">
-            <span
-              data-over={s.caloriesConsumed > s.caloriesTarget}
-              style={{ width: `${Math.min(100, (s.caloriesConsumed / Math.max(1, s.caloriesTarget)) * 100)}%` }}
-            />
-          </div>
-          <div className="macros">
-            <Macro name="Protein" remaining={s.proteinRemaining} target={s.proteinTarget} />
-            <Macro name="Carbs" remaining={s.carbsRemaining} target={s.carbsTarget} />
-            <Macro name="Fat" remaining={s.fatRemaining} target={s.fatTarget} />
+          <div className="macro-line">
+            <Macro name="Protein" remaining={s.proteinRemaining} />
+            <Macro name="Carbs" remaining={s.carbsRemaining} />
+            <Macro name="Fat" remaining={s.fatRemaining} />
           </div>
         </div>
 
-        <div className="card card-quiet">
-          <div className="row" style={{ paddingTop: 0 }}>
-            <span className="k">Latest ideal dinner</span>
-            <span className="v">{formatClock(s.latestIdealDinnerTime)}</span>
-          </div>
-          <div className="row">
-            <span className="k">Usual sleep time</span>
-            <span className="v">{formatClock(s.usualSleepTime)}</span>
-          </div>
-          <div className="row">
-            <span className="k">Recovery context</span>
-            <span className="v" style={{ textAlign: "right", maxWidth: "60%" }}>
-              {s.sleepOrRecoveryContext || "Not provided"}
-            </span>
-          </div>
-        </div>
+        <p className="context-line">
+          Dinner by {formatClock(s.latestIdealDinnerTime)}, sleep at {formatClock(s.usualSleepTime)}.
+          {s.sleepOrRecoveryContext ? ` ${s.sleepOrRecoveryContext}` : ""}
+        </p>
       </section>
 
       <section>
@@ -300,14 +285,14 @@ function Home({
           }}
         />
         <button className="btn" disabled={busy} onClick={() => fileRef.current?.click()}>
-          {busy ? "Estimating nutrition…" : "Take or upload meal photo"}
+          {busy ? "Estimating nutrition…" : "Log what I eat"}
         </button>
         <label className="checkline">
           <input type="checkbox" checked={isDinner} onChange={(e) => setIsDinner(e.target.checked)} />
           This meal is dinner
         </label>
         <button className="btn btn-quiet" onClick={() => setManual((m) => !m)}>
-          {manual ? "Hide manual entry" : "Enter a meal manually"}
+          {manual ? "Hide manual entry" : "Enter it manually"}
         </button>
 
         {lastMeal && !busy && (
@@ -328,11 +313,11 @@ function Home({
           </div>
         )}
         {data.recommendation ? (
-          <div className="card">
+          <div className="card card-primary">
             <div className="rec-headline">{data.recommendation.headline}</div>
-            <div style={{ marginTop: 12 }}>
+            <div className="rec-lines">
               <div className="rec-line">
-                <div className="k">What to eat</div>
+                <div className="k">What</div>
                 <div className="v">{data.recommendation.what}</div>
               </div>
               <div className="rec-line">
@@ -344,11 +329,7 @@ function Home({
                 <div className="v">{data.recommendation.byWhen}</div>
               </div>
             </div>
-            {data.recommendation.note && (
-              <div className="metric-caption" style={{ marginTop: 12 }}>
-                {data.recommendation.note}
-              </div>
-            )}
+            {data.recommendation.note && <p className="rec-note">{data.recommendation.note}</p>}
             {data.recommendation.stale && (
               <div className="status" data-tone="warning" style={{ marginTop: 12 }}>
                 Using last known data. The recommendation could not be refreshed.
@@ -369,14 +350,16 @@ function Home({
   );
 }
 
-function Macro({ name, remaining, target }: { name: string; remaining: number; target: number }) {
+// Over target is a real state, not a zero.
+function Macro({ name, remaining }: { name: string; remaining: number }) {
+  const over = remaining < 0;
   return (
-    <div className="macro">
-      <div className="name">{name} left</div>
-      <div className="amount">
-        {Math.max(0, remaining)}g <span className="of">/ {target}g</span>
-      </div>
-    </div>
+    <span className="macro">
+      <span className="name">{name}</span>
+      <span className="amount" data-over={over}>
+        {Math.abs(remaining)}g {over ? "over" : "left"}
+      </span>
+    </span>
   );
 }
 
@@ -489,22 +472,10 @@ function Details({ data }: { data: AppState }) {
       <section>
         <div className="section-label">Remaining</div>
         <div className="card">
-          <div className="row" style={{ paddingTop: 0 }}>
-            <span className="k">Calories</span>
-            <span className="v">{s.caloriesRemaining.toLocaleString()} kcal</span>
-          </div>
-          <div className="row">
-            <span className="k">Protein</span>
-            <span className="v">{s.proteinRemaining.toLocaleString()} g</span>
-          </div>
-          <div className="row">
-            <span className="k">Carbohydrates</span>
-            <span className="v">{s.carbsRemaining.toLocaleString()} g</span>
-          </div>
-          <div className="row">
-            <span className="k">Fat</span>
-            <span className="v">{s.fatRemaining.toLocaleString()} g</span>
-          </div>
+          <RemainingRow k="Calories" value={s.caloriesRemaining} unit="kcal" first />
+          <RemainingRow k="Protein" value={s.proteinRemaining} unit="g" />
+          <RemainingRow k="Carbohydrates" value={s.carbsRemaining} unit="g" />
+          <RemainingRow k="Fat" value={s.fatRemaining} unit="g" />
         </div>
       </section>
 
@@ -527,6 +498,20 @@ function Details({ data }: { data: AppState }) {
         </div>
       </section>
     </>
+  );
+}
+
+// Same treatment as Home: over target is stated, not shown as a negative.
+function RemainingRow({ k, value, unit, first }: { k: string; value: number; unit: string; first?: boolean }) {
+  const over = value < 0;
+  return (
+    <div className="row" style={first ? { paddingTop: 0 } : undefined}>
+      <span className="k">{k}</span>
+      <span className="v" data-over={over}>
+        {Math.abs(value).toLocaleString()} {unit}
+        {over ? " over" : ""}
+      </span>
+    </div>
   );
 }
 
