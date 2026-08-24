@@ -1,49 +1,9 @@
-import { CurrentState, Meal, Recommendation, Settings, store } from "./store";
-import { formatClock, toHHMM, toMinutes } from "./format";
+// Server-only. The two Claude calls: photo -> macros, Current State -> recommendation.
+// Neither function holds state; the browser owns the day.
+
+import { CurrentState, Recommendation } from "./state";
+import { formatClock } from "./format";
 import { claude, MODEL, withRetry } from "./claude";
-
-// Demo/product parameter (PRD §6) — minutes between finishing dinner and usual sleep time.
-export const DINNER_SLEEP_BUFFER_MINUTES = 180;
-
-export function computeCurrentState(settings: Settings, meals: Meal[], now = new Date()): CurrentState {
-  const sum = (pick: (m: Meal) => number) => Math.round(meals.reduce((t, m) => t + pick(m), 0));
-
-  const caloriesConsumed = sum((m) => m.calories);
-  const proteinConsumed = sum((m) => m.protein);
-  const carbsConsumed = sum((m) => m.carbs);
-  const fatConsumed = sum((m) => m.fat);
-
-  const currentMinutes = now.getHours() * 60 + now.getMinutes();
-  const sleepMinutes = toMinutes(settings.usualSleepTime);
-  const latestMinutes = sleepMinutes - DINNER_SLEEP_BUFFER_MINUTES;
-
-  return {
-    currentTime: toHHMM(currentMinutes),
-    caloriesConsumed,
-    caloriesTarget: settings.calorieTarget,
-    caloriesRemaining: settings.calorieTarget - caloriesConsumed,
-    proteinConsumed,
-    proteinTarget: settings.proteinTarget,
-    proteinRemaining: settings.proteinTarget - proteinConsumed,
-    carbsConsumed,
-    carbsTarget: settings.carbsTarget,
-    carbsRemaining: settings.carbsTarget - carbsConsumed,
-    fatConsumed,
-    fatTarget: settings.fatTarget,
-    fatRemaining: settings.fatTarget - fatConsumed,
-    usualSleepTime: settings.usualSleepTime,
-    latestIdealDinnerTime: toHHMM(latestMinutes),
-    minutesUntilLatestDinner: latestMinutes - currentMinutes,
-    sleepOrRecoveryContext: settings.sleepRecoveryContext,
-    dietaryPreferences: settings.dietaryPreferences,
-    dinnerLogged: meals.some((m) => m.isDinner),
-    mealCount: meals.length,
-  };
-}
-
-export function currentState(now = new Date()): CurrentState {
-  return computeCurrentState(store.settings, store.meals, now);
-}
 
 /* Meal photo → estimated calories and macros (FR2) ------------------------- */
 
@@ -135,7 +95,8 @@ const RECOMMENDATION_SYSTEM = [
   "Write short, plain, operational sentences. No marketing language, no hype, no urgency, no humor, no emoji.",
   "Do not make medical claims and do not diagnose. Keep guidance conservative and practical.",
   "Answer exactly three things: what to eat, how much, and by when.",
-  "Base the quantity on the remaining calories and macros you are given. Respect the dietary preferences.",
+  "Base the quantity on the remaining calories and macros you are given.",
+  "Respect the dietary preferences exactly. Never name a food that conflicts with them, not even as an alternative.",
   "If recovery or sleep has been poor, keep the meal lighter and easier to digest, and say so in one line.",
   "Use the latest ideal dinner time exactly as provided.",
 ].join(" ");
@@ -169,31 +130,18 @@ function statePrompt(s: CurrentState): string {
   ].join("\n");
 }
 
-export async function refreshRecommendation(now = new Date()): Promise<void> {
-  const state = currentState(now);
+export async function generateRecommendation(state: CurrentState): Promise<Recommendation> {
+  const response = await withRetry(() =>
+    claude.messages.create({
+      model: MODEL,
+      max_tokens: 4000,
+      system: RECOMMENDATION_SYSTEM,
+      messages: [{ role: "user", content: statePrompt(state) }],
+      output_config: { effort: "medium", format: { type: "json_schema", schema: RECOMMENDATION_SCHEMA } },
+    }),
+  );
 
-  // Regenerate only when the inputs changed (PRD §7), not on every page load.
-  const key = JSON.stringify([store.settings, store.meals.map((m) => m.id)]);
-  if (key === store.recommendationKey && store.recommendation && !store.recommendation.stale) return;
-
-  try {
-    const response = await withRetry(() =>
-      claude.messages.create({
-        model: MODEL,
-        max_tokens: 4000,
-        system: RECOMMENDATION_SYSTEM,
-        messages: [{ role: "user", content: statePrompt(state) }],
-        output_config: { effort: "medium", format: { type: "json_schema", schema: RECOMMENDATION_SCHEMA } },
-      }),
-    );
-
-    const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-    const parsed = JSON.parse(text) as Omit<Recommendation, "stale">;
-    store.recommendation = { ...parsed, stale: false };
-    store.recommendationKey = key;
-  } catch (e) {
-    console.error("Recommendation generation failed:", e);
-    // PRD §7: keep the last valid recommendation rather than showing a broken screen.
-    if (store.recommendation) store.recommendation.stale = true;
-  }
+  const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const parsed = JSON.parse(text) as Omit<Recommendation, "stale">;
+  return { ...parsed, stale: false };
 }

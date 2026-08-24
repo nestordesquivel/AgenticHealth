@@ -23,13 +23,15 @@ Mobile-first MVP: meal photos → estimated macros → Current State → one din
 
 ## How it works
 
-- `lib/store.ts` — in-memory store for settings, meals, and the last recommendation. Resets on
-  server restart.
-- `lib/agent.ts` — deterministic aggregation and dinner timing, plus the two Claude calls
-  (photo → macros, Current State → recommendation).
-- `app/api/meal` — logs a meal from a photo or from typed macros.
-- `app/api/state` — reads state, saves settings, resets the day.
-- `app/page.tsx` — Home, Details, and Settings.
+- `lib/state.ts` — types plus the deterministic logic: daily aggregation, nutrition gaps, and
+  the dinner timing rule. Pure, so both the browser and the API routes use it.
+- `lib/agent.ts` — the two Claude calls: photo → macros, Current State → recommendation.
+- `app/api/meal` — an image in, an estimate out.
+- `app/api/recommendation` — a Current State in, one recommendation out.
+- `app/page.tsx` — Home, Details, and Settings. Holds the day and saves it to `localStorage`.
+
+The API routes keep no state. The day belongs to the browser, so each visitor has their own
+and nothing is shared between them.
 
 Dinner timing is `usual sleep time − DINNER_SLEEP_BUFFER_MINUTES` (currently 180), set in
 `lib/agent.ts`.
@@ -52,10 +54,8 @@ Settings → "Reset today's data".
    Nothing else is required. There is no database and no authentication.
 4. Deploy.
 
-### Known limitation of the deployed demo
+### State on the deployed demo
 
-State lives in server memory, as specified for the MVP. On Vercel this means the day's
-meals are held by whichever serverless instance handles the request: the data can reset
-when a new instance starts, and simultaneous visitors may share one instance's data.
-This is fine for a single presenter demonstrating the flow, and is the expected trade-off
-of running with no database.
+Each visitor's day is held in their own browser and persists across a refresh. It is scoped
+to the calendar date, so a new day starts clean. Clearing site data, or using a different
+browser or device, starts a new day — there is no account and no database, by design.

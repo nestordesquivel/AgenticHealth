@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { CurrentState, Meal, Recommendation, Settings } from "@/lib/store";
+import type { CurrentState, Meal, Recommendation, Settings } from "@/lib/state";
+import { computeCurrentState, DEFAULT_SETTINGS } from "@/lib/state";
 import { formatClock } from "@/lib/format";
 
 type AppState = {
@@ -10,6 +11,44 @@ type AppState = {
   currentState: CurrentState;
   recommendation: Recommendation | null;
 };
+
+// The day lives in this browser only. Each visitor has their own; the server keeps none.
+type Day = {
+  date: string; // YYYY-MM-DD, so a new day starts clean
+  settings: Settings;
+  meals: Meal[];
+  recommendation: Recommendation | null;
+};
+
+const STORAGE_KEY = "dinner-agent-day-v1";
+
+const today = () => new Date().toISOString().slice(0, 10);
+
+function loadDay(): Day {
+  const fresh: Day = { date: today(), settings: DEFAULT_SETTINGS, meals: [], recommendation: null };
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return fresh;
+    const saved = JSON.parse(raw) as Day;
+    return saved.date === today() ? saved : fresh;
+  } catch {
+    return fresh;
+  }
+}
+
+function saveDay(day: Day) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(day));
+  } catch {
+    // Photos can overflow the storage quota. Keep the numbers, drop the images.
+    try {
+      const light = { ...day, meals: day.meals.map(({ imageDataUrl, ...m }) => m) };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(light));
+    } catch {
+      // Storage unavailable. The day still works, it just will not survive a refresh.
+    }
+  }
+}
 
 type Tab = "home" | "details" | "settings";
 
@@ -20,16 +59,66 @@ export default function Page() {
     const h = window.location.hash.slice(1);
     return h === "details" || h === "settings" ? h : "home";
   });
-  const [data, setData] = useState<AppState | null>(null);
+  const [day, setDay] = useState<Day | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetch("/api/state")
-      .then((r) => r.json())
-      .then(setData)
-      .catch(() => setError("Could not load today's data. Refresh to try again."));
-  }, []);
+  // Mirrors `day` synchronously, so a change made while a recommendation request is
+  // still in flight builds on the newest day rather than a stale render's copy.
+  const dayRef = useRef<Day | null>(null);
+  const latestRequest = useRef(0);
+
+  function commit(next: Day) {
+    dayRef.current = next;
+    setDay(next);
+    saveDay(next);
+  }
+
+  // Read storage after mount so the server and client first render match.
+  useEffect(() => commit(loadDay()), []);
+
+  // Apply a change, then regenerate the recommendation from the new state (FR11).
+  async function apply(next: Day) {
+    const request = ++latestRequest.current;
+    commit(next);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/recommendation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentState: computeCurrentState(next.settings, next.meals) }),
+      });
+      if (!res.ok) throw new Error();
+      const recommendation = (await res.json()) as Recommendation;
+      // Ignore a response that a newer change has already superseded.
+      if (request === latestRequest.current && dayRef.current) {
+        commit({ ...dayRef.current, recommendation });
+      }
+    } catch {
+      // PRD §7: keep the last valid recommendation rather than showing a broken screen.
+      if (request === latestRequest.current && dayRef.current) {
+        const previous = dayRef.current.recommendation;
+        commit({ ...dayRef.current, recommendation: previous ? { ...previous, stale: true } : null });
+      }
+    } finally {
+      if (request === latestRequest.current) setBusy(false);
+    }
+  }
+
+  const logMeal = (meal: Meal) => {
+    const current = dayRef.current;
+    if (current) apply({ ...current, meals: [...current.meals, meal] });
+  };
+  const saveSettings = (settings: Settings) => {
+    const current = dayRef.current;
+    if (current) apply({ ...current, settings });
+  };
+  const resetDay = () =>
+    commit({ date: today(), settings: DEFAULT_SETTINGS, meals: [], recommendation: null });
+
+  const data: AppState | null = day
+    ? { ...day, currentState: computeCurrentState(day.settings, day.meals) }
+    : null;
 
   if (!data) {
     return (
@@ -64,9 +153,11 @@ export default function Page() {
           </div>
         )}
 
-        {tab === "home" && <Home data={data} setData={setData} busy={busy} setBusy={setBusy} setError={setError} />}
+        {tab === "home" && (
+          <Home data={data} logMeal={logMeal} busy={busy} setBusy={setBusy} setError={setError} />
+        )}
         {tab === "details" && <Details data={data} />}
-        {tab === "settings" && <SettingsView data={data} setData={setData} setError={setError} />}
+        {tab === "settings" && <SettingsView data={data} saveSettings={saveSettings} resetDay={resetDay} />}
       </div>
 
       <nav className="nav">
@@ -91,13 +182,13 @@ export default function Page() {
 
 function Home({
   data,
-  setData,
+  logMeal,
   busy,
   setBusy,
   setError,
 }: {
   data: AppState;
-  setData: (s: AppState) => void;
+  logMeal: (meal: Meal) => void;
   busy: boolean;
   setBusy: (b: boolean) => void;
   setError: (e: string | null) => void;
@@ -116,12 +207,32 @@ function Home({
       const res = await fetch("/api/meal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageDataUrl, isDinner }),
+        body: JSON.stringify({ imageDataUrl }),
       });
       if (!res.ok) throw new Error();
-      const next = (await res.json()) as AppState & { meal: Meal };
-      setData(next);
-      setLastMeal(next.meal);
+      const estimate = (await res.json()) as {
+        label: string;
+        calories: number;
+        protein: number;
+        carbs: number;
+        fat: number;
+        confident: boolean;
+      };
+      const meal: Meal = {
+        id: crypto.randomUUID(),
+        loggedAt: new Date().toISOString(),
+        label: estimate.label,
+        calories: estimate.calories,
+        protein: estimate.protein,
+        carbs: estimate.carbs,
+        fat: estimate.fat,
+        approximate: !estimate.confident,
+        source: "photo",
+        isDinner,
+        imageDataUrl,
+      };
+      setLastMeal(meal);
+      logMeal(meal);
     } catch {
       setError("The photo could not be analyzed. Enter the meal manually to continue.");
       setManual(true);
@@ -206,7 +317,7 @@ function Home({
           </div>
         )}
 
-        {manual && <ManualEntry setData={setData} onDone={() => setManual(false)} setError={setError} isDinner={isDinner} />}
+        {manual && <ManualEntry logMeal={logMeal} onDone={() => setManual(false)} isDinner={isDinner} />}
       </section>
 
       <section>
@@ -270,45 +381,34 @@ function Macro({ name, remaining, target }: { name: string; remaining: number; t
 }
 
 function ManualEntry({
-  setData,
+  logMeal,
   onDone,
-  setError,
   isDinner,
 }: {
-  setData: (s: AppState) => void;
+  logMeal: (meal: Meal) => void;
   onDone: () => void;
-  setError: (e: string | null) => void;
   isDinner: boolean;
 }) {
   const [form, setForm] = useState({ label: "", calories: "", protein: "", carbs: "", fat: "" });
   const [saving, setSaving] = useState(false);
 
-  async function save() {
+  // No model call needed, so this path keeps working even when the API is unavailable.
+  function save() {
     setSaving(true);
-    try {
-      const res = await fetch("/api/meal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          isDinner,
-          manual: {
-            label: form.label || "Meal",
-            calories: Number(form.calories) || 0,
-            protein: Number(form.protein) || 0,
-            carbs: Number(form.carbs) || 0,
-            fat: Number(form.fat) || 0,
-          },
-        }),
-      });
-      if (!res.ok) throw new Error();
-      setData(await res.json());
-      setError(null);
-      onDone();
-    } catch {
-      setError("The meal could not be saved. Try again.");
-    } finally {
-      setSaving(false);
-    }
+    logMeal({
+      id: crypto.randomUUID(),
+      loggedAt: new Date().toISOString(),
+      label: form.label || "Meal",
+      calories: Number(form.calories) || 0,
+      protein: Number(form.protein) || 0,
+      carbs: Number(form.carbs) || 0,
+      fat: Number(form.fat) || 0,
+      approximate: false,
+      source: "manual",
+      isDinner,
+    });
+    setSaving(false);
+    onDone();
   }
 
   return (
@@ -445,52 +545,38 @@ function TotalRow({ k, consumed, target, unit }: { k: string; consumed: number; 
 
 function SettingsView({
   data,
-  setData,
-  setError,
+  saveSettings,
+  resetDay,
 }: {
   data: AppState;
-  setData: (s: AppState) => void;
-  setError: (e: string | null) => void;
+  saveSettings: (settings: Settings) => void;
+  resetDay: () => void;
 }) {
   const [form, setForm] = useState<Settings>(data.settings);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  async function save() {
+  function save() {
     setSaving(true);
     setSaved(false);
-    try {
-      const res = await fetch("/api/state", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          calorieTarget: Number(form.calorieTarget) || 0,
-          proteinTarget: Number(form.proteinTarget) || 0,
-          carbsTarget: Number(form.carbsTarget) || 0,
-          fatTarget: Number(form.fatTarget) || 0,
-          usualSleepTime: form.usualSleepTime,
-          dietaryPreferences: form.dietaryPreferences,
-          sleepRecoveryContext: form.sleepRecoveryContext,
-        }),
-      });
-      if (!res.ok) throw new Error();
-      const next = (await res.json()) as AppState;
-      setData(next);
-      setForm(next.settings);
-      setSaved(true);
-      setError(null);
-    } catch {
-      setError("Settings could not be saved. Try again.");
-    } finally {
-      setSaving(false);
-    }
+    const settings: Settings = {
+      calorieTarget: Number(form.calorieTarget) || 0,
+      proteinTarget: Number(form.proteinTarget) || 0,
+      carbsTarget: Number(form.carbsTarget) || 0,
+      fatTarget: Number(form.fatTarget) || 0,
+      usualSleepTime: form.usualSleepTime,
+      dietaryPreferences: form.dietaryPreferences,
+      sleepRecoveryContext: form.sleepRecoveryContext,
+    };
+    saveSettings(settings);
+    setForm(settings);
+    setSaved(true);
+    setSaving(false);
   }
 
-  async function reset() {
-    const res = await fetch("/api/state", { method: "DELETE" });
-    const next = (await res.json()) as AppState;
-    setData(next);
-    setForm(next.settings);
+  function reset() {
+    resetDay();
+    setForm(DEFAULT_SETTINGS);
     setSaved(false);
   }
 
